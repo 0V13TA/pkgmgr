@@ -139,12 +139,15 @@ func runCommand(name string, args ...string) error {
 	return cmd.Run()
 }
 
-func gitCommit(dotfilesDir, message string, paths ...string) {
+func gitCommit(dotfilesDir, message string, paths ...string) error {
 	addArgs := append([]string{"-C", dotfilesDir, "add"}, paths...)
-	_ = runCommand("git", addArgs...)
-	if err := runCommand("git", "-C", dotfilesDir, "commit", "-m", message); err != nil {
-		fmt.Printf("Git commit skipped or failed: %v\n", err)
+	if err := runCommand("git", addArgs...); err != nil {
+		return fmt.Errorf("git add failed: %w", err)
 	}
+	if err := runCommand("git", "-C", dotfilesDir, "commit", "-m", message); err != nil {
+		return fmt.Errorf("git commit failed: %w", err)
+	}
+	return nil
 }
 
 func isOfficialPackage(pkg string) bool {
@@ -284,6 +287,14 @@ func watchPath(targetPath string) {
 	fmt.Printf("==> Running stow for package '%s'...\n", pkgName)
 	if err := runCommand("stow", "-v", "-R", "-d", dotfilesDir, "-t", home, pkgName); err != nil {
 		fmt.Fprintf(os.Stderr, "Stow failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "==> Rolling back %s to original location...\n", stowTargetDestination)
+		
+		// Atomic Rollback
+		if rbErr := os.Rename(stowTargetDestination, absTarget); rbErr != nil {
+			fmt.Fprintf(os.Stderr, "CRITICAL ERROR: Rollback failed. File stuck at %s\n", stowTargetDestination)
+		} else {
+			fmt.Println("==> Rollback successful.")
+		}
 		os.Exit(1)
 	}
 
@@ -297,8 +308,11 @@ func watchPath(targetPath string) {
 	_ = updateMakefilePackages(dotfilesDir, pkgName)
 
 	commitMsg := fmt.Sprintf("Added %s config to dotfiles", pkgName)
-	gitCommit(dotfilesDir, commitMsg, stowPkgDir, iniPath, filepath.Join(dotfilesDir, "Makefile"))
-	fmt.Printf("==> Successfully tracked and committed %s!\n", pkgName)
+	if err := gitCommit(dotfilesDir, commitMsg, stowPkgDir, iniPath, filepath.Join(dotfilesDir, "Makefile")); err != nil {
+		fmt.Fprintf(os.Stderr, "==> Failed to commit changes: %v\n", err)
+	} else {
+		fmt.Printf("==> Successfully tracked and committed %s!\n", pkgName)
+	}
 }
 
 func saveCurrentDir(message string) {
@@ -325,8 +339,11 @@ func saveCurrentDir(message string) {
 	targetPath := filepath.Join(dotfilesDir, pkgName)
 
 	fmt.Printf("==> Staging and committing changes for package '%s'...\n", pkgName)
-	gitCommit(dotfilesDir, message, targetPath)
-	fmt.Printf("==> Changes saved: %s\n", message)
+	if err := gitCommit(dotfilesDir, message, targetPath); err != nil {
+		fmt.Fprintf(os.Stderr, "==> Failed to commit changes: %v\n", err)
+	} else {
+		fmt.Printf("==> Changes saved: %s\n", message)
+	}
 }
 
 func updateConfigs() {
@@ -375,8 +392,11 @@ func updateConfigs() {
 func bootstrapFromIni(source string) {
 	tempFile := source
 
-	// If source is a URL, fetch it to a temporary file
 	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+		if strings.HasPrefix(source, "http://") {
+			fmt.Println("Warning: Using unencrypted HTTP for bootstrap. HTTPS is recommended.")
+		}
+		
 		fmt.Printf("==> Downloading %s...\n", source)
 		resp, err := http.Get(source)
 		if err != nil {
@@ -384,6 +404,11 @@ func bootstrapFromIni(source string) {
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "Failed to fetch URL: HTTP %d %s\n", resp.StatusCode, resp.Status)
+			os.Exit(1)
+		}
 
 		tmp, err := os.CreateTemp("", "packages-*.ini")
 		if err != nil {
@@ -405,7 +430,6 @@ func bootstrapFromIni(source string) {
 
 	dotfilesDir := getDotfilesDir()
 
-	// Clone remote repo if not present
 	if _, err := os.Stat(dotfilesDir); os.IsNotExist(err) {
 		if pkgs.Remote == "" {
 			fmt.Fprintf(os.Stderr, "Error: No remote repository defined in [meta] section of %s\n", source)
@@ -418,7 +442,6 @@ func bootstrapFromIni(source string) {
 		}
 	}
 
-	// Update configs and sync packages
 	updateConfigs()
 	syncAll(filepath.Join(dotfilesDir, "packages.ini"))
 	fmt.Println("==> System bootstrap complete!")
@@ -514,7 +537,9 @@ func main() {
 			_ = savePackages(iniPath, pkgs)
 			allAdded := append(pacmanAdded, aurAdded...)
 			commitMsg := fmt.Sprintf("Installed %s", strings.Join(allAdded, ", "))
-			gitCommit(dotfilesDir, commitMsg, iniPath)
+			if err := gitCommit(dotfilesDir, commitMsg, iniPath); err != nil {
+				fmt.Fprintf(os.Stderr, "==> Failed to commit changes: %v\n", err)
+			}
 		}
 
 	} else if strings.HasPrefix(action, "-R") {
@@ -540,7 +565,9 @@ func main() {
 			}
 			_ = savePackages(iniPath, pkgs)
 			commitMsg := fmt.Sprintf("Uninstalled %s", strings.Join(removed, ", "))
-			gitCommit(dotfilesDir, commitMsg, iniPath)
+			if err := gitCommit(dotfilesDir, commitMsg, iniPath); err != nil {
+				fmt.Fprintf(os.Stderr, "==> Failed to commit changes: %v\n", err)
+			}
 		}
 	} else {
 		_ = runCommand("yay", os.Args[1:]...)
